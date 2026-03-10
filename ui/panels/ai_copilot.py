@@ -1,210 +1,207 @@
 """
 AI Assistant Panel for CyberOctet
-Chat-style interface with LLM-powered packet analysis
+Chat-style interface with BYOK (Bring Your Own Key) support.
+
+Supported providers:
+  1. GPT (OpenAI)     — api.openai.com
+  2. Claude (Anthropic) — api.anthropic.com
+  3. Gemini (Google)  — generativelanguage.googleapis.com
+  4. Groq (Free)      — api.groq.com  (OpenAI-compatible)
+  5. Ollama (Local)   — localhost:11434  (no key required)
 """
 
-import os
-import time
+import html as _html
 import json
-from typing import Optional, List, Dict, Any
+import os
+import re
+import urllib.error
+import urllib.request
+from typing import List, Optional, Dict, Any
+
+from PySide6.QtCore import Qt, Signal, QThread, QSize
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
-    QPushButton, QLabel, QFrame, QScrollArea, QSplitter,
-    QGroupBox, QProgressBar, QComboBox, QDialog, QFormLayout,
-    QDialogButtonBox, QMessageBox
+    QPushButton, QLabel, QFrame, QComboBox,
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QThread, QSize
-from PySide6.QtGui import QFont, QTextCursor, QColor, QIcon
 
 from core.config import Config
 from core.capture_engine import PacketInfo
 from core.protocol_decoder.decoder import ProtocolDecoder, ProtocolLayer
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# System prompt used for every AI request
-# ──────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """\
-You are an expert network analyst and packet forensics assistant embedded in a packet capture tool.
-The user will provide raw packet data, decoded fields, or ask questions about network traffic.
-Your job is to:
-1. Clearly explain what the packet is doing in plain language
-2. Identify the protocol stack (e.g., Ethernet > IP > TCP > HTTP)
-3. Flag any anomalies, suspicious patterns, or security concerns
-4. When asked to "follow the stream", reconstruct and summarize the application-layer conversation
-5. Answer technical questions about packet fields, flags, checksums, and protocol behavior
-Be concise but thorough. Use bullet points for multi-part explanations.\
-"""
+SYSTEM_PROMPT = (
+    "You are a network security expert assistant embedded inside a packet analyzer "
+    "tool similar to Wireshark. Help the user understand captured network traffic, "
+    "protocols, anomalies, and potential security issues. Be concise, technical, and precise."
+)
+
+# Provider registry: internal_id → (display label, needs_key, default_model)
+_PROVIDERS = [
+    ("openai",    "GPT (OpenAI)",      True,  "gpt-4o"),
+    ("anthropic", "Claude (Anthropic)", True,  "claude-opus-4-5"),
+    ("gemini",    "Gemini (Google)",   True,  "gemini-2.0-flash"),
+    ("groq",      "Groq (Free)",       True,  "llama-3.3-70b-versatile"),
+    ("ollama",    "Ollama (Local)",    False, "llama3"),
+]
+
+_OPENAI_URL      = "https://api.openai.com/v1/chat/completions"
+_ANTHROPIC_URL   = "https://api.anthropic.com/v1/messages"
+_ANTHROPIC_VER   = "2023-06-01"
+_GROQ_URL        = "https://api.groq.com/openai/v1/chat/completions"
+_OLLAMA_URL      = "http://localhost:11434/api/chat"
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Background worker thread for AI calls
-# ──────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Background AI worker thread
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AIWorkerThread(QThread):
-    """Background thread for AI API calls — never blocks the UI."""
+    """Runs the API call in a background thread so the UI stays responsive."""
 
     response_ready = Signal(str)
     error_occurred = Signal(str)
 
-    def __init__(self, query: str, context: Dict[str, Any], parent=None):
+    def __init__(self, messages: List[Dict], provider: str, api_key: str, parent=None):
         super().__init__(parent)
-        self.query = query
-        self.context = context
+        self.messages = messages   # list of {"role": ..., "content": ...}
+        self.provider = provider   # one of the provider ids above
+        self.api_key  = api_key
+
+    # ── HTTP helper ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _http_post(url: str, headers: Dict, body: Dict) -> Dict:
+        data = json.dumps(body).encode("utf-8")
+        req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    # ── Provider-specific callers ─────────────────────────────────────────────
+
+    def _call_openai(self) -> str:
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        body = {
+            "model":    "gpt-4o",
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + self.messages,
+        }
+        result = self._http_post(_OPENAI_URL, headers, body)
+        return result["choices"][0]["message"]["content"]
+
+    def _call_anthropic(self) -> str:
+        headers = {
+            "Content-Type":      "application/json",
+            "x-api-key":         self.api_key,
+            "anthropic-version": _ANTHROPIC_VER,
+        }
+        body = {
+            "model":      "claude-opus-4-5",
+            "max_tokens": 1024,
+            "system":     SYSTEM_PROMPT,
+            "messages":   self.messages,
+        }
+        result = self._http_post(_ANTHROPIC_URL, headers, body)
+        return result["content"][0]["text"]
+
+    def _call_gemini(self) -> str:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={self.api_key}"
+        )
+        # Build a single user turn that includes all history
+        # Gemini v1beta expects alternating user/model roles
+        contents = []
+        for msg in self.messages:
+            role = "model" if msg["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+        body = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": contents,
+        }
+        # No Authorization header — key is in the URL
+        headers = {"Content-Type": "application/json"}
+        result = self._http_post(url, headers, body)
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+
+    def _call_groq(self) -> str:
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        body = {
+            "model":    "llama-3.3-70b-versatile",
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + self.messages,
+        }
+        result = self._http_post(_GROQ_URL, headers, body)
+        return result["choices"][0]["message"]["content"]
+
+    def _call_ollama(self) -> str:
+        body = {
+            "model":    "llama3",
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + self.messages,
+            "stream":   False,
+        }
+        headers = {"Content-Type": "application/json"}
+        result = self._http_post(_OLLAMA_URL, headers, body)
+        return result["message"]["content"]
+
+    # ── run ───────────────────────────────────────────────────────────────────
 
     def run(self):
+        provider_needs_key = next(
+            (needs for pid, _, needs, _ in _PROVIDERS if pid == self.provider), True
+        )
+        if provider_needs_key and not self.api_key:
+            self.error_occurred.emit(
+                "No API key configured. Enter your key in the panel above and click Save."
+            )
+            return
         try:
-            # Try to use the AICopilot engine from ai/copilot.py
-            copilot = self.context.get("copilot")
-            packet_info = self.context.get("packet_info")
-            protocol_layers = self.context.get("protocol_layers", [])
-
-            if copilot and packet_info:
-                response = copilot.analyze_packet(packet_info, protocol_layers, self.query)
-                self.response_ready.emit(response.response)
-            elif copilot:
-                # Free-form question without packet context
-                # Use the LLM directly if available
-                provider = copilot._provider
-                from ai.copilot import StaticRulesProvider
-                if not isinstance(provider, StaticRulesProvider):
-                    result = provider.complete(SYSTEM_PROMPT, self.query)
-                    if result:
-                        self.response_ready.emit(result)
-                        return
-                self.response_ready.emit(
-                    "Please select a packet first, or set up an API key in "
-                    "Settings (⚙) to ask general questions."
-                )
-            else:
-                self.response_ready.emit(
-                    "AI engine not initialized. Open Settings (⚙) to configure your API key."
-                )
+            dispatch = {
+                "openai":    self._call_openai,
+                "anthropic": self._call_anthropic,
+                "gemini":    self._call_gemini,
+                "groq":      self._call_groq,
+                "ollama":    self._call_ollama,
+            }
+            fn = dispatch.get(self.provider)
+            if fn is None:
+                self.error_occurred.emit(f"Unknown provider: {self.provider}")
+                return
+            text = fn()
+            self.response_ready.emit(text)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode()
+                detail = json.loads(body).get("error", {}).get("message", body)
+            except Exception:
+                detail = str(exc)
+            self.error_occurred.emit(f"API error {exc.code}: {detail}")
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Settings dialog
-# ──────────────────────────────────────────────────────────────────────────
-
-class AISettingsDialog(QDialog):
-    """Settings dialog for API key, provider, and model selection."""
-
-    def __init__(self, parent=None, current_provider="openai", current_model="gpt-4o",
-                 current_key=""):
-        super().__init__(parent)
-        self.setWindowTitle("AI Assistant Settings")
-        self.setMinimumWidth(420)
-        self.setStyleSheet(f"""
-            QDialog {{
-                background-color: {Config.COLORS['background']};
-                color: {Config.COLORS['text_primary']};
-            }}
-            QLabel {{
-                color: {Config.COLORS['text_secondary']};
-                background: transparent;
-            }}
-            QLineEdit, QComboBox {{
-                background-color: {Config.COLORS['surface_light']};
-                color: {Config.COLORS['text_primary']};
-                border: 1px solid {Config.COLORS['border']};
-                padding: 5px;
-            }}
-            QPushButton {{
-                background-color: {Config.COLORS['primary']};
-                color: {Config.COLORS['surface']};
-                border: none;
-                padding: 6px 14px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: {Config.COLORS['secondary']};
-            }}
-        """)
-
-        layout = QFormLayout(self)
-
-        # Provider
-        self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["OpenAI", "Anthropic"])
-        idx = 0 if current_provider.lower() == "openai" else 1
-        self.provider_combo.setCurrentIndex(idx)
-        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        layout.addRow("Provider:", self.provider_combo)
-
-        # Model
-        self.model_combo = QComboBox()
-        self._populate_models()
-        if current_model:
-            mi = self.model_combo.findText(current_model)
-            if mi >= 0:
-                self.model_combo.setCurrentIndex(mi)
-        layout.addRow("Model:", self.model_combo)
-
-        # API key
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setPlaceholderText("Paste your API key here")
-        if current_key:
-            self.api_key_edit.setText(current_key)
-        layout.addRow("API Key:", self.api_key_edit)
-
-        # Info
-        info = QLabel("Key is stored locally in your OS credential store (keyring) or config file.")
-        info.setWordWrap(True)
-        info.setStyleSheet(f"color: {Config.COLORS['text_muted']}; font-size: 8pt;")
-        layout.addRow(info)
-
-        # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def _on_provider_changed(self, _idx):
-        self._populate_models()
-
-    def _populate_models(self):
-        self.model_combo.clear()
-        if self.provider_combo.currentText() == "OpenAI":
-            self.model_combo.addItems(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"])
-        else:
-            self.model_combo.addItems([
-                "claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022",
-                "claude-3-haiku-20240307",
-            ])
-
-    def get_settings(self) -> Dict[str, str]:
-        return {
-            "provider": self.provider_combo.currentText().lower(),
-            "model": self.model_combo.currentText(),
-            "api_key": self.api_key_edit.text().strip(),
-        }
-
-
-# ──────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Chat bubble helper
-# ──────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_bubble_html(sender: str, message: str, is_user: bool) -> str:
-    """Return styled HTML for a single chat bubble."""
-    bg = "#0d2b1a" if is_user else "#1a1a1a"
-    align = "right" if is_user else "left"
-    name_color = "#00ff88" if not is_user else "#00aaff"
-    border_color = "#00ff8840" if not is_user else "#00aaff40"
+    if is_user:
+        bg, align, name_color, border_color = "#0d2b45", "right", "#00aaff", "#00aaff40"
+    else:
+        bg, align, name_color, border_color = "#1a1a1a", "left",  "#00ff88", "#00ff8840"
 
-    # Escape HTML in message, then convert newlines and markdown-bold
-    import html as _html
     safe = _html.escape(message)
     safe = safe.replace("\n", "<br>")
-    # Simple bold: **text** → <b>text</b>
-    import re
     safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
-    # Bullet points
     safe = re.sub(r"^- ", "• ", safe, flags=re.MULTILINE)
-    safe = re.sub(r"^• ", "&nbsp;&nbsp;• ", safe, flags=re.MULTILINE)
 
     return (
         f'<div style="text-align:{align}; margin:4px 0;">'
@@ -216,184 +213,116 @@ def _make_bubble_html(sender: str, message: str, is_user: bool) -> str:
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Main widget
-# ──────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AICopilotWidget(QWidget):
-    """AI Assistant tab — chat-bubble interface with LLM integration."""
+    """AI Assistant tab — 5-provider BYOK panel + chat bubble interface."""
 
     def __init__(self):
         super().__init__()
 
-        self.current_packet: Optional[PacketInfo] = None
-        self.current_layers: List[ProtocolLayer] = []
-        self.protocol_decoder = ProtocolDecoder()
-        self.ai_thread: Optional[AIWorkerThread] = None
+        self.current_packet: Optional[PacketInfo]  = None
+        self.current_layers: List[ProtocolLayer]   = []
+        self.protocol_decoder                      = ProtocolDecoder()
+        self.ai_thread: Optional[AIWorkerThread]   = None
+        self.all_packets: List[PacketInfo]         = []
 
-        # AI engine (from ai/copilot.py)
-        self._copilot = None
-        self._init_copilot()
+        # Chat history as list of {"role", "content"}
+        self._chat_history: List[Dict] = []
 
-        # Stored settings
-        self._provider_name = "openai"
-        self._model_name = "gpt-4o"
-        self._api_key = ""
+        # Per-provider key storage  {"openai": "sk-...", "anthropic": "...", ...}
+        self._keys: Dict[str, str] = {pid: "" for pid, *_ in _PROVIDERS}
+        self._provider = "openai"
         self._load_settings()
-
-        # Captured packets reference (set by MainWindow)
-        self.all_packets: List[PacketInfo] = []
 
         self.setup_ui()
         self.setup_style()
+        self._on_provider_changed()   # sync UI to loaded settings
 
-    # ── AI engine init ────────────────────────────────────────────────────
+    # ── persistence ───────────────────────────────────────────────────────────
 
-    def _init_copilot(self):
-        try:
-            from ai.copilot import AICopilot
-            self._copilot = AICopilot()
-        except Exception as exc:
-            print(f"[AIAssistant] Could not init AICopilot: {exc}")
-            self._copilot = None
+    def _settings_path(self) -> str:
+        return os.path.join(os.path.expanduser("~"), ".cyberoctet_ai.json")
 
     def _load_settings(self):
-        """Load saved settings from config file."""
-        config_path = os.path.join(os.path.expanduser("~"), ".cyberoctet_ai.json")
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r") as f:
+        try:
+            if os.path.exists(self._settings_path()):
+                with open(self._settings_path()) as f:
                     data = json.load(f)
-                self._provider_name = data.get("provider", "openai")
-                self._model_name = data.get("model", "gpt-4o")
-                self._api_key = data.get("api_key", "")
-                if self._api_key:
-                    self._apply_key_to_copilot()
-            except Exception:
-                pass
+                self._provider = data.get("provider", "openai")
+                # Support old single-key format and new dict format
+                if "keys" in data:
+                    for pid, key in data["keys"].items():
+                        if pid in self._keys:
+                            self._keys[pid] = key
+                elif "api_key" in data:
+                    old_provider = data.get("provider", "openai")
+                    self._keys[old_provider] = data.get("api_key", "")
+        except Exception:
+            pass
 
     def _save_settings(self):
-        """Save settings to config file."""
-        config_path = os.path.join(os.path.expanduser("~"), ".cyberoctet_ai.json")
         try:
-            with open(config_path, "w") as f:
-                json.dump({
-                    "provider": self._provider_name,
-                    "model": self._model_name,
-                    "api_key": self._api_key,
-                }, f)
+            with open(self._settings_path(), "w") as f:
+                json.dump({"provider": self._provider, "keys": self._keys}, f)
         except Exception as exc:
             print(f"[AIAssistant] Failed to save settings: {exc}")
 
-    def _apply_key_to_copilot(self):
-        """Apply the current API key + model to the copilot engine."""
-        if not self._copilot:
-            self._init_copilot()
-        if not self._copilot:
-            return
-
-        try:
-            if self._provider_name == "openai" and self._api_key:
-                os.environ["OPENAI_API_KEY"] = self._api_key
-                from ai.copilot import OpenAIAssistant
-                provider = OpenAIAssistant(model=self._model_name)
-                if provider.is_available:
-                    self._copilot.configure_provider(provider)
-            elif self._provider_name == "anthropic" and self._api_key:
-                os.environ["ANTHROPIC_API_KEY"] = self._api_key
-                try:
-                    from ai.copilot_anthropic import AnthropicProvider
-                    provider = AnthropicProvider(model=self._model_name,
-                                                 api_key=self._api_key)
-                    if provider.is_available:
-                        self._copilot.configure_provider(provider)
-                except ImportError:
-                    # Anthropic provider module not available — use inline
-                    self._init_anthropic_inline()
-        except Exception as exc:
-            print(f"[AIAssistant] Failed to apply key: {exc}")
-
-    def _init_anthropic_inline(self):
-        """Create a simple Anthropic provider inline if the module isn't installed."""
-        try:
-            import anthropic
-            from ai.copilot import LLMProvider
-
-            class _AnthropicInline(LLMProvider):
-                def __init__(self, model, api_key):
-                    self._model = model
-                    self._client = anthropic.Anthropic(api_key=api_key)
-
-                @property
-                def name(self):
-                    return f"Anthropic ({self._model})"
-
-                @property
-                def is_available(self):
-                    return True
-
-                def complete(self, system_prompt, user_message):
-                    try:
-                        resp = self._client.messages.create(
-                            model=self._model,
-                            max_tokens=1024,
-                            system=system_prompt,
-                            messages=[{"role": "user", "content": user_message}],
-                        )
-                        return resp.content[0].text
-                    except Exception as e:
-                        print(f"Anthropic error: {e}")
-                        return None
-
-            provider = _AnthropicInline(self._model_name, self._api_key)
-            if self._copilot:
-                self._copilot.configure_provider(provider)
-        except ImportError:
-            print("[AIAssistant] anthropic package not installed. pip install anthropic")
-
-    # ── UI setup ──────────────────────────────────────────────────────────
+    # ── UI setup ──────────────────────────────────────────────────────────────
 
     def setup_ui(self):
-        """Setup the AI Assistant chat UI."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
 
-        # ── Header ──
-        header_frame = QFrame()
-        header_layout = QHBoxLayout(header_frame)
+        # ── 1. BYOK panel ─────────────────────────────────────────────────────
+        byok_frame = QFrame()
+        byok_frame.setObjectName("byokFrame")
+        byok_layout = QHBoxLayout(byok_frame)
+        byok_layout.setContentsMargins(8, 6, 8, 6)
+        byok_layout.setSpacing(6)
 
-        title_label = QLabel("🤖 AI Assistant")
-        title_label.setStyleSheet(f"""
-            QLabel {{
-                color: {Config.COLORS['primary']};
-                font-size: 12pt;
-                font-weight: bold;
-                background: transparent;
-            }}
-        """)
-        header_layout.addWidget(title_label)
+        # Provider dropdown
+        self.provider_combo = QComboBox()
+        for pid, label, *_ in _PROVIDERS:
+            self.provider_combo.addItem(label, pid)
+        idx = self.provider_combo.findData(self._provider)
+        if idx >= 0:
+            self.provider_combo.setCurrentIndex(idx)
+        self.provider_combo.setMaximumWidth(160)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        byok_layout.addWidget(self.provider_combo)
 
-        header_layout.addStretch()
+        # Password-style API key field
+        self.key_field = QLineEdit()
+        self.key_field.setEchoMode(QLineEdit.Password)
+        self.key_field.setPlaceholderText("Paste your API key here…")
+        byok_layout.addWidget(self.key_field, 1)
 
-        # Provider status
-        self.provider_label = QLabel("")
-        self.provider_label.setStyleSheet(
-            f"color: {Config.COLORS['text_muted']}; font-size: 8pt; background: transparent;"
+        # "No key needed" placeholder label (shown for Ollama)
+        self.no_key_label = QLabel("No key needed — Ollama must be running locally")
+        self.no_key_label.setStyleSheet(
+            "color: #666666; font-size: 8pt; background: transparent;"
         )
-        self._update_provider_label()
-        header_layout.addWidget(self.provider_label)
+        self.no_key_label.setVisible(False)
+        byok_layout.addWidget(self.no_key_label, 1)
 
-        # Settings gear button
-        self.settings_btn = QPushButton("⚙")
-        self.settings_btn.setMaximumSize(QSize(28, 28))
-        self.settings_btn.setToolTip("AI Settings — API key, model, provider")
-        self.settings_btn.clicked.connect(self.open_settings)
-        header_layout.addWidget(self.settings_btn)
+        # Save button
+        self.save_key_btn = QPushButton("Save")
+        self.save_key_btn.setMaximumWidth(52)
+        self.save_key_btn.clicked.connect(self._on_save_key)
+        byok_layout.addWidget(self.save_key_btn)
 
-        layout.addWidget(header_frame)
+        # Status dot
+        self.key_status_label = QLabel("● No key")
+        self.key_status_label.setAlignment(Qt.AlignVCenter)
+        byok_layout.addWidget(self.key_status_label)
 
-        # ── Chat history ──
+        layout.addWidget(byok_frame)
+
+        # ── 2. Chat history ───────────────────────────────────────────────────
         self.chat_area = QTextEdit()
         self.chat_area.setReadOnly(True)
         self.chat_area.setStyleSheet(f"""
@@ -405,9 +334,9 @@ class AICopilotWidget(QWidget):
                 font-size: 9pt;
             }}
         """)
-        layout.addWidget(self.chat_area, 1)  # stretch
+        layout.addWidget(self.chat_area, 1)
 
-        # ── Thinking indicator ──
+        # ── 3. Thinking indicator ─────────────────────────────────────────────
         self.thinking_label = QLabel("")
         self.thinking_label.setStyleSheet(
             f"color: {Config.COLORS['primary']}; font-style: italic; "
@@ -416,28 +345,28 @@ class AICopilotWidget(QWidget):
         self.thinking_label.setVisible(False)
         layout.addWidget(self.thinking_label)
 
-        # ── Quick actions ──
+        # ── 4. Quick action buttons ───────────────────────────────────────────
         quick_frame = QFrame()
         quick_layout = QHBoxLayout(quick_frame)
         quick_layout.setContentsMargins(2, 2, 2, 2)
 
-        self.explain_btn = QPushButton("💡 Explain Selected Packet")
-        self.explain_btn.clicked.connect(self._on_explain_clicked)
-        quick_layout.addWidget(self.explain_btn)
+        explain_btn = QPushButton("💡 Explain Packet")
+        explain_btn.clicked.connect(self._on_explain_clicked)
+        quick_layout.addWidget(explain_btn)
 
-        self.follow_btn = QPushButton("🔗 Follow Stream")
-        self.follow_btn.clicked.connect(self._on_follow_stream_clicked)
-        quick_layout.addWidget(self.follow_btn)
+        follow_btn = QPushButton("🔗 Follow Stream")
+        follow_btn.clicked.connect(self._on_follow_stream_clicked)
+        quick_layout.addWidget(follow_btn)
 
-        self.suspicious_btn = QPushButton("⚠ Check Suspicious")
-        self.suspicious_btn.clicked.connect(
-            lambda: self._send_prefilled("Is this traffic suspicious? Analyze for anomalies.")
+        suspicious_btn = QPushButton("⚠ Check Suspicious")
+        suspicious_btn.clicked.connect(
+            lambda: self._do_send("Is this traffic suspicious? Analyze for anomalies.")
         )
-        quick_layout.addWidget(self.suspicious_btn)
+        quick_layout.addWidget(suspicious_btn)
 
         layout.addWidget(quick_frame)
 
-        # ── Input bar ──
+        # ── 5. Input bar ──────────────────────────────────────────────────────
         input_layout = QHBoxLayout()
 
         self.input_field = QLineEdit()
@@ -454,13 +383,12 @@ class AICopilotWidget(QWidget):
         # Welcome message
         self._append_bubble(
             "AI Assistant",
-            "Hello! Select a packet and ask me anything, or click a quick action above.\n"
-            "Set up your API key via ⚙ for full LLM-powered analysis.",
+            "Hello! Select a provider and enter your API key above, then select a packet and ask.\n"
+            "Ollama (Local) works without a key if Ollama is running on port 11434.",
             is_user=False,
         )
 
     def setup_style(self):
-        """Apply dark cyber theme styling."""
         self.setStyleSheet(f"""
             QWidget {{
                 background-color: {Config.COLORS['surface']};
@@ -472,16 +400,28 @@ class AICopilotWidget(QWidget):
                 border: 1px solid {Config.COLORS['border']};
                 border-radius: 5px;
             }}
+            QFrame#byokFrame {{
+                background-color: #151515;
+                border: 1px solid {Config.COLORS['border']};
+                border-radius: 6px;
+            }}
             QLineEdit {{
                 background-color: {Config.COLORS['surface_light']};
                 border: 1px solid {Config.COLORS['border']};
                 color: {Config.COLORS['text_primary']};
-                padding: 6px;
+                padding: 5px;
+                font-size: 9pt;
+            }}
+            QComboBox {{
+                background-color: {Config.COLORS['surface_light']};
+                border: 1px solid {Config.COLORS['border']};
+                color: {Config.COLORS['text_primary']};
+                padding: 4px;
                 font-size: 9pt;
             }}
             QPushButton {{
                 background-color: {Config.COLORS['primary']};
-                color: {Config.COLORS['surface']};
+                color: #0a0a0a;
                 border: none;
                 padding: 5px 10px;
                 font-weight: bold;
@@ -489,56 +429,108 @@ class AICopilotWidget(QWidget):
             }}
             QPushButton:hover {{
                 background-color: {Config.COLORS['secondary']};
+                color: #ffffff;
             }}
             QPushButton:pressed {{
                 background-color: {Config.COLORS['accent']};
+                color: #ffffff;
             }}
         """)
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # ── Provider selection logic ───────────────────────────────────────────────
 
-    def set_packet_context(self, packet_info: PacketInfo,
-                           protocol_layers: List[ProtocolLayer]):
-        """Called by MainWindow when a packet is selected."""
+    def _current_provider_id(self) -> str:
+        return self.provider_combo.currentData() or "openai"
+
+    def _on_provider_changed(self):
+        """Called whenever the provider dropdown changes. Syncs key field + status."""
+        pid = self._current_provider_id()
+        needs_key = next((nk for p, _, nk, _ in _PROVIDERS if p == pid), True)
+
+        if needs_key:
+            # Show key field + save button
+            self.key_field.setVisible(True)
+            self.save_key_btn.setVisible(True)
+            self.no_key_label.setVisible(False)
+            # Load saved key for this provider
+            self.key_field.setText(self._keys.get(pid, ""))
+            self._update_key_status(pid)
+        else:
+            # Ollama — hide key field
+            self.key_field.setVisible(False)
+            self.save_key_btn.setVisible(False)
+            self.no_key_label.setVisible(True)
+            self.key_status_label.setText("● Ready")
+            self.key_status_label.setStyleSheet(
+                "color: #00ff88; font-weight: bold; background: transparent;"
+            )
+
+    def _update_key_status(self, pid: str = None):
+        if pid is None:
+            pid = self._current_provider_id()
+        if hasattr(self, "key_status_label"):
+            has_key = bool(self._keys.get(pid, ""))
+            if has_key:
+                self.key_status_label.setText("● Connected")
+                self.key_status_label.setStyleSheet(
+                    "color: #00ff88; font-weight: bold; background: transparent;"
+                )
+            else:
+                self.key_status_label.setText("● No key")
+                self.key_status_label.setStyleSheet(
+                    "color: #ff4444; font-weight: bold; background: transparent;"
+                )
+
+    # ── Key save ──────────────────────────────────────────────────────────────
+
+    def _on_save_key(self):
+        pid = self._current_provider_id()
+        key = self.key_field.text().strip()
+        self._keys[pid] = key
+        self._provider = pid
+        self._save_settings()
+        self._update_key_status(pid)
+        provider_label = self.provider_combo.currentText()
+        self._append_bubble(
+            "System",
+            f"✓ API key saved for {provider_label}.",
+            is_user=False,
+        )
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_packet_context(self, packet_info: PacketInfo, protocol_layers: List[ProtocolLayer]):
         self.current_packet = packet_info
         self.current_layers = protocol_layers
 
     def set_all_packets(self, packets: List[PacketInfo]):
-        """Store reference to the full captured packets list."""
         self.all_packets = packets
 
-    # ── Chat actions ──────────────────────────────────────────────────────
+    # ── Chat actions ──────────────────────────────────────────────────────────
 
     def send_query(self):
-        """Send the user's typed query to the AI."""
         query = self.input_field.text().strip()
         if not query:
             return
         self.input_field.clear()
         self._do_send(query)
 
-    def _send_prefilled(self, text: str):
-        """Send a pre-built query (from quick-action buttons)."""
-        self._do_send(text)
-
     def _on_explain_clicked(self):
         if not self.current_packet:
-            self._append_bubble("System", "⚠ No packet selected. Click a row in the packet list first.", False)
+            self._append_bubble("System", "⚠ No packet selected. Click a row first.", False)
             return
         pkt = self.current_packet
-        context_lines = [
+        lines = [
             f"Protocol: {pkt.protocol.upper()}",
             f"Source: {pkt.src_ip}" + (f":{pkt.src_port}" if pkt.src_port else ""),
             f"Destination: {pkt.dst_ip}" + (f":{pkt.dst_port}" if pkt.dst_port else ""),
             f"Length: {pkt.length} bytes",
         ]
         if pkt.flags:
-            context_lines.append(f"TCP Flags: {pkt.flags}")
+            lines.append(f"TCP Flags: {pkt.flags}")
         if pkt.raw_data:
-            hex_preview = pkt.raw_data[:64].hex(" ")
-            context_lines.append(f"Hex (first 64 bytes): {hex_preview}")
-        prompt = "Explain this packet in detail:\n" + "\n".join(context_lines)
-        self._do_send(prompt)
+            lines.append(f"Hex (first 64 bytes): {pkt.raw_data[:64].hex(' ')}")
+        self._do_send("Explain this packet in detail:\n" + "\n".join(lines))
 
     def _on_follow_stream_clicked(self):
         if not self.current_packet:
@@ -546,104 +538,73 @@ class AICopilotWidget(QWidget):
             return
         pkt = self.current_packet
         if not pkt.src_ip or not pkt.dst_ip:
-            self._append_bubble("System", "⚠ Selected packet has no IP info for stream following.", False)
+            self._append_bubble("System", "⚠ Packet has no IP info for stream following.", False)
             return
-
-        # Collect matching packets
-        stream_pkts = []
-        for p in self.all_packets:
-            if self._same_stream(pkt, p):
-                stream_pkts.append(p)
-
+        stream_pkts = [p for p in self.all_packets if self._same_stream(pkt, p)]
         if len(stream_pkts) <= 1:
-            self._append_bubble("System", "Only 1 packet matches this stream. Need more captured data.", False)
+            self._append_bubble("System", "Only 1 packet in stream. Capture more traffic first.", False)
             return
-
-        # Build context
-        lines = [f"Follow and summarize the full stream of this connection."]
-        lines.append(f"Stream: {pkt.src_ip}:{pkt.src_port} ↔ {pkt.dst_ip}:{pkt.dst_port}")
-        lines.append(f"Total packets in stream: {len(stream_pkts)}\n")
-
-        for i, sp in enumerate(stream_pkts[:50]):  # Limit to 50 packets
+        lines = [
+            "Follow and summarize this connection stream.",
+            f"Stream: {pkt.src_ip}:{pkt.src_port} ↔ {pkt.dst_ip}:{pkt.dst_port}",
+            f"Total packets: {len(stream_pkts)}\n",
+        ]
+        for i, sp in enumerate(stream_pkts[:50]):
             direction = "→" if sp.src_ip == pkt.src_ip else "←"
             line = (f"[{i+1}] {direction} {sp.src_ip}:{sp.src_port} → "
-                    f"{sp.dst_ip}:{sp.dst_port} | {sp.protocol.upper()} "
-                    f"| {sp.length}B")
+                    f"{sp.dst_ip}:{sp.dst_port} | {sp.protocol.upper()} | {sp.length}B")
             if sp.flags:
                 line += f" | Flags: {sp.flags}"
             lines.append(line)
-
         self._do_send("\n".join(lines))
 
     @staticmethod
     def _same_stream(a: PacketInfo, b: PacketInfo) -> bool:
-        """Check if two packets belong to the same TCP/UDP stream."""
         if not all([a.src_ip, a.dst_ip, b.src_ip, b.dst_ip]):
             return False
-        ips_a = frozenset([a.src_ip, a.dst_ip])
-        ips_b = frozenset([b.src_ip, b.dst_ip])
-        if ips_a != ips_b:
-            return False
-        ports_a = frozenset([a.src_port, a.dst_port])
-        ports_b = frozenset([b.src_port, b.dst_port])
-        return ports_a == ports_b
+        return (frozenset([a.src_ip, a.dst_ip]) == frozenset([b.src_ip, b.dst_ip]) and
+                frozenset([a.src_port, a.dst_port]) == frozenset([b.src_port, b.dst_port]))
 
     def _do_send(self, query: str):
-        """Core send logic — adds user bubble, starts AI worker."""
+        """Core send: prepend packet context, add user bubble, start worker."""
+        # Auto-prepend selected packet context
+        full_query = query
+        if self.current_packet:
+            pkt = self.current_packet
+            sp = f":{pkt.src_port}" if pkt.src_port else ""
+            dp = f":{pkt.dst_port}" if pkt.dst_port else ""
+            info = getattr(pkt, "info", "") or pkt.protocol.upper()
+            context_line = (
+                f"Selected packet: {pkt.protocol.upper()} | "
+                f"{pkt.src_ip}{sp} → {pkt.dst_ip}{dp} | {info}"
+            )
+            full_query = f"[Context: {context_line}]\n\n{query}"
+
         self._append_bubble("You", query, is_user=True)
         self._show_thinking(True)
 
-        context = {
-            "copilot": self._copilot,
-            "packet_info": self.current_packet,
-            "protocol_layers": self.current_layers,
-        }
+        self._chat_history.append({"role": "user", "content": full_query})
+        if len(self._chat_history) > 20:
+            self._chat_history = self._chat_history[-20:]
 
-        self.ai_thread = AIWorkerThread(query, context)
+        pid = self._current_provider_id()
+        api_key = self._keys.get(pid, "")
+
+        self.ai_thread = AIWorkerThread(list(self._chat_history), pid, api_key)
         self.ai_thread.response_ready.connect(self._on_response)
         self.ai_thread.error_occurred.connect(self._on_error)
         self.ai_thread.start()
 
     def _on_response(self, text: str):
         self._show_thinking(False)
+        self._chat_history.append({"role": "assistant", "content": text})
         self._append_bubble("AI Assistant", text, is_user=False)
 
     def _on_error(self, error: str):
         self._show_thinking(False)
         self._append_bubble("System", f"❌ Error: {error}", is_user=False)
 
-    # ── Settings ──────────────────────────────────────────────────────────
-
-    def open_settings(self):
-        dlg = AISettingsDialog(
-            self,
-            current_provider=self._provider_name,
-            current_model=self._model_name,
-            current_key=self._api_key,
-        )
-        if dlg.exec() == QDialog.Accepted:
-            settings = dlg.get_settings()
-            self._provider_name = settings["provider"]
-            self._model_name = settings["model"]
-            self._api_key = settings["api_key"]
-            self._save_settings()
-            self._apply_key_to_copilot()
-            self._update_provider_label()
-            self._append_bubble(
-                "System",
-                f"Settings updated — Provider: {self._provider_name.title()}, "
-                f"Model: {self._model_name}",
-                is_user=False,
-            )
-
-    def _update_provider_label(self):
-        if self._copilot:
-            name = self._copilot.active_provider_name
-            self.provider_label.setText(f"Provider: {name}")
-        else:
-            self.provider_label.setText("Provider: not configured")
-
-    # ── UI helpers ────────────────────────────────────────────────────────
+    # ── UI helpers ─────────────────────────────────────────────────────────────
 
     def _append_bubble(self, sender: str, message: str, is_user: bool):
         html = _make_bubble_html(sender, message, is_user)
@@ -654,15 +615,17 @@ class AICopilotWidget(QWidget):
 
     def _show_thinking(self, show: bool):
         if show:
-            self.thinking_label.setText("⏳ Thinking…")
+            self.thinking_label.setText("⏳ AI is thinking…")
             self.thinking_label.setVisible(True)
             self.send_btn.setEnabled(False)
+            self.input_field.setEnabled(False)
         else:
             self.thinking_label.setVisible(False)
             self.send_btn.setEnabled(True)
+            self.input_field.setEnabled(True)
 
     def clear_conversation(self):
-        """Clear the conversation."""
+        self._chat_history.clear()
         self.chat_area.clear()
         self._append_bubble(
             "AI Assistant",

@@ -276,7 +276,7 @@ class MainWindow(QMainWindow):
 
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText(
-            "BPF filter (e.g., tcp port 80, host 192.168.1.1)"
+            "Display filter (e.g., dns, tcp and port 443, host 192.168.1.1)"
         )
         filter_layout.addWidget(self.filter_edit)
 
@@ -289,7 +289,16 @@ class MainWindow(QMainWindow):
         filter_help_btn = QPushButton("?")
         filter_help_btn.setMaximumWidth(25)
         filter_help_btn.setToolTip(
-            "Common filters:\ntcp port 80\nudp port 53\nhost 192.168.1.1\nnet 192.168.0.0/24"
+            "Display filter cheatsheet:\n"
+            "  dns  tcp  udp  icmp  arp  http\n"
+            "  port 53   src port 1234   dst port 80\n"
+            "  host 1.2.3.4   src host 10.0.0.1\n"
+            "  ip.src == 1.2.3.4   ip.dst == 8.8.8.8\n"
+            "  tcp.port == 443\n"
+            "  net 192.168.0.0/24\n"
+            "  not tcp   tcp and port 443\n"
+            "  (tcp or udp) and port 53\n"
+            "Click for full reference →"
         )
         filter_help_btn.clicked.connect(self.show_filter_help)
         filter_layout.addWidget(filter_help_btn)
@@ -834,27 +843,39 @@ class MainWindow(QMainWindow):
         elif dialog_type == "service":
             self.npcap_dialog_manager.show_service_error_dialog()
     def apply_filter(self):
-        """Validate and apply BPF filter"""
+        """Validate and apply display filter to already-captured packets."""
+        from core.packet_filter import PacketFilter
+
         filter_text = self.filter_edit.text().strip()
+
         if not filter_text:
+            # No filter — show everything
             self.filter_status_label.setText("")
-            self.capture_engine.set_filter("")
+            self.filter_status_label.setStyleSheet("")
+            self._active_filter_text = ""
+            self.packet_table.filter_packets(None)
             self._last_filter_text = ""
             self._last_filter_validation = (True, "")
             return
 
-        valid, error = self.capture_engine.validate_filter(filter_text)
+        # Validate syntax (pure-Python, never BPF)
+        valid, error = PacketFilter.validate(filter_text)
         self._last_filter_text = filter_text
         self._last_filter_validation = (valid, error)
+
         if valid:
-            self.capture_engine.set_filter(filter_text)
-            self.filter_status_label.setText("Filter active")
+            self._active_filter_text = filter_text
+            self.filter_status_label.setText("✓ Filter active")
             self.filter_status_label.setStyleSheet(
                 "color: #00ff88; font-weight: bold; background: transparent;"
             )
+            # Apply filter to currently displayed packets
+            self.packet_table.filter_packets(
+                lambda pkt, f=filter_text: PacketFilter.match(pkt, f)
+            )
         else:
-            self.capture_engine.set_filter("")
-            self.filter_status_label.setText(f"Invalid: {error}")
+            self._active_filter_text = ""
+            self.filter_status_label.setText(f"✗ {error}")
             self.filter_status_label.setStyleSheet(
                 "color: #ff4444; font-weight: bold; background: transparent;"
             )
@@ -894,32 +915,8 @@ class MainWindow(QMainWindow):
         if not ok:
             self.status_label.setText(f"Unknown interface: {interface}")
             return
-        # Auto-apply filter before starting
-        filter_text = self.filter_edit.text().strip()
-        if filter_text:
-            if filter_text == self._last_filter_text:
-                valid, error = self._last_filter_validation
-            else:
-                valid, error = self.capture_engine.validate_filter(filter_text)
-                self._last_filter_text = filter_text
-                self._last_filter_validation = (valid, error)
-
-            if not valid:
-                self.capture_engine.set_filter("")
-                self.filter_status_label.setText(f"Invalid: {error}")
-                self.filter_status_label.setStyleSheet(
-                    "color: #ff4444; font-weight: bold; background: transparent;"
-                )
-                self.status_label.setText("Fix filter before starting capture")
-                return
-
-            self.capture_engine.set_filter(filter_text)
-            self.filter_status_label.setText("Filter active")
-            self.filter_status_label.setStyleSheet(
-                "color: #00ff88; font-weight: bold; background: transparent;"
-            )
-        else:
-            self.capture_engine.set_filter("")
+        # Filter is now display-only (post-capture) — no BPF filter is passed to scapy.
+        # Capture all packets; filtering runs on the already-captured list via apply_filter().
 
         # Check Npcap status (handled by warning banner if not ready)
         if not self.capture_engine.is_capture_ready():
@@ -947,44 +944,113 @@ class MainWindow(QMainWindow):
         self.filter_status_label.setText("")
 
     def show_filter_help(self):
-        """Show filter help dialog"""
-        from PySide6.QtWidgets import QMessageBox
+        """Show comprehensive filter syntax reference dialog."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QPushButton
 
-        help_text = """🔍 BPF Filter Examples
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Display Filter Reference")
+        dlg.setMinimumSize(600, 560)
+        dlg.setStyleSheet("""
+            QDialog   { background-color: #0a0a0a; color: #e0e0e0; }
+            QTextBrowser {
+                background-color: #111111;
+                border: 1px solid #333333;
+                color: #e0e0e0;
+                font-family: Consolas, 'Courier New', monospace;
+                font-size: 10pt;
+                padding: 8px;
+            }
+            QPushButton {
+                background-color: #00ff88;
+                color: #0a0a0a;
+                border: none;
+                padding: 6px 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #00aaff; color: #ffffff; }
+        """)
 
-**Basic Filters:**
-• tcp port 80        - HTTP traffic only
-• udp port 53        - DNS traffic only  
-• host 192.168.1.1 - Traffic to/from specific IP
-• net 192.168.0.0/24 - Traffic from/to network
+        layout = QVBoxLayout(dlg)
 
-**Protocol Filters:**
-• tcp               - TCP traffic only
-• udp               - UDP traffic only
-• icmp              - ICMP traffic only
-• arp               - ARP traffic only
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml("""
+<style>
+  body   { background:#111; color:#e0e0e0;
+            font-family:Consolas,'Courier New',monospace; font-size:10pt; margin:8px; }
+  h2     { color:#00ff88; border-bottom:1px solid #333; padding-bottom:4px; }
+  h3     { color:#00aaff; margin-top:12px; margin-bottom:4px; }
+  table  { width:100%; border-collapse:collapse; margin-bottom:8px; }
+  th     { background:#1a1a1a; color:#00ff88; padding:4px 8px;
+            text-align:left; border:1px solid #333; }
+  td     { padding:4px 8px; border:1px solid #222;
+            vertical-align:top; }
+  td.expr{ color:#00ff88; white-space:nowrap; }
+  td.desc{ color:#aaaaaa; }
+  .note  { background:#0d2b1a; border-left:3px solid #00ff88;
+            padding:6px 10px; margin:8px 0; color:#cccccc; }
+</style>
 
-**Port Filters:**
-• port 80           - Port 80 (any protocol)
-• portrange 1-1024  - Port range
-• not port 22        - All except SSH
+<h2>&#128270; Display Filter Reference</h2>
+<p class="note">Filters run on <b>already-captured</b> packets. They are applied immediately
+when you click <b>Apply Filter</b> or press <b>Enter</b>.
+Boolean logic: <b>and &nbsp; or &nbsp; not</b>. Parentheses for grouping.</p>
 
-**Combined Filters:**
-• tcp and port 443   - HTTPS traffic
-• host 10.0.0.1 and udp - UDP from specific host
-• not tcp and not arp - Exclude TCP and ARP
+<h3>Protocol Names (bare)</h3>
+<table>
+  <tr><th>Expression</th><th>Matches</th></tr>
+  <tr><td class="expr">tcp</td>        <td class="desc">TCP packets</td></tr>
+  <tr><td class="expr">udp</td>        <td class="desc">UDP packets (includes DNS, DHCP, mDNS)</td></tr>
+  <tr><td class="expr">dns</td>        <td class="desc">DNS traffic (protocol=dns OR port 53)</td></tr>
+  <tr><td class="expr">icmp</td>       <td class="desc">ICMP echo / ping</td></tr>
+  <tr><td class="expr">arp</td>        <td class="desc">ARP requests &amp; replies</td></tr>
+  <tr><td class="expr">http</td>       <td class="desc">HTTP (protocol=http OR TCP port 80/8080)</td></tr>
+  <tr><td class="expr">tls</td>        <td class="desc">TLS / SSL packets</td></tr>
+</table>
 
-**Tips:**
-• Use 'and'/'or' to combine conditions
-• Use 'not' to exclude traffic
-• Use parentheses for grouping
-• Click '?' button for this help anytime"""
+<h3>Port Matching</h3>
+<table>
+  <tr><th>Expression</th><th>Matches</th></tr>
+  <tr><td class="expr">port 53</td>           <td class="desc">Src OR dst port = 53</td></tr>
+  <tr><td class="expr">src port 1234</td>     <td class="desc">Source port = 1234</td></tr>
+  <tr><td class="expr">dst port 80</td>       <td class="desc">Destination port = 80</td></tr>
+  <tr><td class="expr">tcp.port == 443</td>   <td class="desc">TCP src or dst port = 443</td></tr>
+  <tr><td class="expr">not port 22</td>       <td class="desc">Exclude SSH</td></tr>
+</table>
 
-        msg = QMessageBox()
-        msg.setWindowTitle("Filter Help")
-        msg.setText(help_text)
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec_()
+<h3>IP / Host Matching</h3>
+<table>
+  <tr><th>Expression</th><th>Matches</th></tr>
+  <tr><td class="expr">host 8.8.8.8</td>            <td class="desc">Src OR dst IP = 8.8.8.8</td></tr>
+  <tr><td class="expr">ip 8.8.8.8</td>              <td class="desc">Same as host</td></tr>
+  <tr><td class="expr">src host 192.168.1.5</td>    <td class="desc">Source IP only</td></tr>
+  <tr><td class="expr">dst host 10.0.0.1</td>       <td class="desc">Destination IP only</td></tr>
+  <tr><td class="expr">ip.src == 192.168.1.1</td>   <td class="desc">Wireshark-style field equality</td></tr>
+  <tr><td class="expr">ip.dst == 8.8.4.4</td>       <td class="desc">Destination IP equals</td></tr>
+  <tr><td class="expr">net 192.168.0.0/24</td>      <td class="desc">Src OR dst in CIDR subnet</td></tr>
+</table>
+
+<h3>Boolean &amp; Grouping</h3>
+<table>
+  <tr><th>Expression</th><th>Matches</th></tr>
+  <tr><td class="expr">tcp and port 443</td>             <td class="desc">HTTPS traffic</td></tr>
+  <tr><td class="expr">udp or icmp</td>                  <td class="desc">UDP or ICMP packets</td></tr>
+  <tr><td class="expr">not tcp</td>                      <td class="desc">Everything except TCP</td></tr>
+  <tr><td class="expr">not tcp and not arp</td>          <td class="desc">Exclude TCP and ARP</td></tr>
+  <tr><td class="expr">(tcp or udp) and port 53</td>     <td class="desc">DNS over TCP or UDP</td></tr>
+  <tr><td class="expr">host 10.0.0.1 and tcp</td>       <td class="desc">TCP to/from specific host</td></tr>
+  <tr><td class="expr">net 10.0.0.0/8 and not port 22</td><td class="desc">All 10.x.x.x except SSH</td></tr>
+</table>
+
+<p class="note"><b>Tip:</b> Clear the filter field and press Enter (or click Apply) to show all packets again.</p>
+""")
+        layout.addWidget(browser)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec()
 
     def clear_packets(self):
         """Clear captured packets"""
@@ -1018,6 +1084,13 @@ class MainWindow(QMainWindow):
         self.packet_count_label.setText(
             f"Packets: {self.capture_engine.stats.packets_captured}"
         )
+        # Re-apply active display filter so new packets are immediately filtered
+        active_filter = getattr(self, "_active_filter_text", "")
+        if active_filter:
+            from core.packet_filter import PacketFilter
+            self.packet_table.filter_packets(
+                lambda pkt, f=active_filter: PacketFilter.match(pkt, f)
+            )
 
     def on_packet_selected(self, packet_info: PacketInfo):
         """Handle packet selection"""

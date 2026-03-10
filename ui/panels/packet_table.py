@@ -85,9 +85,14 @@ class PacketTableWidget(QTableWidget):
             }}
             
             QTableWidget::item:selected {{
-                background-color: {Config.COLORS['selection']} !important;
-                color: {Config.COLORS['text_primary']};
+                background-color: #1E6FBF !important;
+                color: #ffffff !important;
                 font-weight: bold;
+            }}
+            
+            QTableWidget::item:selected:active {{
+                background-color: #1E6FBF !important;
+                color: #ffffff !important;
             }}
             
             QTableWidget::item:hover {{
@@ -270,13 +275,15 @@ class PacketTableWidget(QTableWidget):
                             break
                     
                     if is_selected:
-                        item.setBackground(QBrush(QColor(Config.COLORS['selection'])))
+                        item.setBackground(QBrush(QColor("#1E6FBF")))
+                        item.setForeground(QBrush(QColor("#ffffff")))
                     else:
-                        # Apply alternating row colors
+                        # Apply alternating row colors and restore default foreground
                         if row % 2 == 0:
                             item.setBackground(QBrush(QColor(Config.COLORS['surface'])))
                         else:
                             item.setBackground(QBrush(QColor(Config.COLORS['surface_light'])))
+                        item.setForeground(QBrush(QColor(Config.COLORS['text_primary'])))
         
         # Get selected packet and emit signal
         current_row = self.currentRow()
@@ -337,7 +344,19 @@ class PacketTableWidget(QTableWidget):
         self.packets.clear()
         self._total_packets_seen = 0
     
-    def filter_packets(self, filter_text: str):
-        """Filter packets based on text"""
-        # TODO: Implement packet filtering
-        pass
+    def filter_packets(self, filter_func=None):
+        """Show/hide rows based on a predicate function.
+        
+        Args:
+            filter_func: callable(PacketInfo) -> bool, or None to show all.
+        """
+        self.setUpdatesEnabled(False)
+        try:
+            for row, pkt in enumerate(self.packets):
+                if filter_func is None:
+                    self.setRowHidden(row, False)
+                else:
+                    hidden = not filter_func(pkt)
+                    self.setRowHidden(row, hidden)
+        finally:
+            self.setUpdatesEnabled(True)
