@@ -140,7 +140,7 @@ def main():
         p.setFont(font_tag)
         p.setPen(QColor("#00aaff"))
         p.drawText(QRectF(0, 82, W, 24), Qt.AlignHCenter,
-                   "Network Packet Analyzer  ·  CyberOctet Labs")
+                   "Network Packet Analyzer")
 
         # Separator line
         p.setPen(QColor("#00ff8840"))

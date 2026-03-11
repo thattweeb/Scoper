@@ -45,7 +45,7 @@ _PROVIDERS = [
     ("openai",    "GPT (OpenAI)",      True,  "gpt-4o"),
     ("anthropic", "Claude (Anthropic)", True,  "claude-opus-4-5"),
     ("gemini",    "Gemini (Google)",   True,  "gemini-2.0-flash"),
-    ("groq",      "Groq (Free)",       True,  "llama-3.3-70b-versatile"),
+    ("groq", "Groq (Free)", True, "llama-3.3-70b-versatile"),
     ("ollama",    "Ollama (Local)",    False, "llama3"),
 ]
 
@@ -132,13 +132,18 @@ class AIWorkerThread(QThread):
 
     def _call_groq(self) -> str:
         headers = {
-            "Content-Type":  "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Ai-Packet/1.0"
         }
+
         body = {
-            "model":    "llama-3.3-70b-versatile",
+            "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + self.messages,
+            "max_tokens": 800,
+            "temperature": 0.2
         }
+
         result = self._http_post(_GROQ_URL, headers, body)
         return result["choices"][0]["message"]["content"]
 
@@ -377,6 +382,10 @@ class AICopilotWidget(QWidget):
         self.send_btn = QPushButton("Ask")
         self.send_btn.clicked.connect(self.send_query)
         input_layout.addWidget(self.send_btn)
+
+        self.clear_btn = QPushButton("Clear Chat")
+        self.clear_btn.clicked.connect(self.clear_conversation)
+        input_layout.addWidget(self.clear_btn)
 
         layout.addLayout(input_layout)
 
