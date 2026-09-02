@@ -1,15 +1,4 @@
-"""
-Main Application Window for CyberOctet Packet Analyzer
-Professional dark-themed cybersecurity interface
 
-Enhancements:
-- Robust error handling and graceful degradation
-- Efficient packet batch processing
-- Wi-Fi interface detection and grouping
-- Keyboard shortcuts for common operations
-- Context menus
-- Modern responsive UI
-"""
 
 import logging
 import sys
@@ -1137,33 +1126,58 @@ Boolean logic: <b>and &nbsp; or &nbsp; not</b>. Parentheses for grouping.</p>
                 self.packet_count_label.setText(f"Packets: {stats.packets_captured}")
 
     def update_metadata(self, packet_info: PacketInfo):
-        """Update metadata display"""
-        metadata = f"""Packet Information:
-================
-Timestamp: {packet_info.timestamp}
-Length: {packet_info.length} bytes
-Interface: {packet_info.interface}
-Protocol: {packet_info.protocol}
-
-Network Layer:
-==============
-Source IP: {packet_info.src_ip}
-Destination IP: {packet_info.dst_ip}
-
-Transport Layer:
-================
-"""
-        if packet_info.src_port:
-            metadata += f"Source Port: {packet_info.src_port}\n"
-        if packet_info.dst_port:
-            metadata += f"Destination Port: {packet_info.dst_port}\n"
+        """Update metadata display with derived/analytical info,
+        not a duplicate of Packet Details."""
+ 
+        # Determine direction relative to this machine's likely local subnet
+        direction = "Unknown"
+        if packet_info.src_ip and packet_info.src_ip.startswith(("192.168.", "10.", "172.")):
+            direction = "Outbound (from local device)"
+        elif packet_info.dst_ip and packet_info.dst_ip.startswith(("192.168.", "10.", "172.")):
+            direction = "Inbound (to local device)"
+ 
+        # Human-readable TCP flags instead of raw hex/int
+        flag_names = {
+            "S": "SYN", "A": "ACK", "F": "FIN", "R": "RST",
+            "P": "PSH", "U": "URG", "E": "ECE", "C": "CWR",
+        }
+        readable_flags = ""
         if packet_info.flags:
-            metadata += f"TCP Flags: {packet_info.flags}\n"
-        if packet_info.seq_num:
-            metadata += f"Sequence Number: {packet_info.seq_num}\n"
-        if packet_info.ack_num:
-            metadata += f"Acknowledgment: {packet_info.ack_num}\n"
-
+            readable_flags = ", ".join(
+                flag_names.get(f, f) for f in str(packet_info.flags)
+            )
+ 
+        metadata = f"""Traffic Analysis
+================
+Direction: {direction}
+Packet Size: {packet_info.length} bytes
+Capture Interface: {packet_info.interface}
+ 
+Connection Context
+===================
+{packet_info.src_ip}:{packet_info.src_port or '-'} -> {packet_info.dst_ip}:{packet_info.dst_port or '-'}
+Protocol: {packet_info.protocol}
+"""
+ 
+        if readable_flags:
+            metadata += f"TCP Flags (decoded): {readable_flags}\n"
+ 
+        if packet_info.seq_num and packet_info.ack_num:
+            metadata += (
+                f"\nSequence Tracking\n==================\n"
+                f"Sequence Number: {packet_info.seq_num}\n"
+                f"Acknowledgment Number: {packet_info.ack_num}\n"
+            )
+ 
+        # Simple size classification -- genuinely useful at a glance
+        if packet_info.length < 64:
+            size_note = "Small packet (control/ACK-like)"
+        elif packet_info.length > 1400:
+            size_note = "Near MTU size (likely carrying payload/data)"
+        else:
+            size_note = "Standard-sized packet"
+        metadata += f"\nSize Classification\n====================\n{size_note}\n"
+ 
         self.metadata_widget.setText(metadata)
 
     def open_capture(self):

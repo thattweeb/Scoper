@@ -1,8 +1,3 @@
-"""
-Packet Details Widget for CyberOctet
-Displays detailed protocol layer information for selected packets
-"""
-
 from typing import Optional, List
 from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QScrollArea,
